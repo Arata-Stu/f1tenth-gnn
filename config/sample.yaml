@@ -1,0 +1,18 @@
+defaults:
+  - vehicle: default
+  - envs: default 
+  - planner: pure_pursuit
+
+## 2d scan buffer
+buffer_size: 5
+downsample_beam: 60
+
+
+## 可視化設定
+render: True
+render_mode: "human" ## human or human_fast
+
+
+hydra:
+  run:
+    dir: ./outputs/sample/${now:%Y-%m-%d}/${now:%H-%M-%S}

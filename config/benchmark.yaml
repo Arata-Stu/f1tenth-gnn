@@ -1,0 +1,27 @@
+defaults:
+  - vehicle: default
+  - envs: default 
+
+dataset:
+
+  target_points: 1080
+  max_steer: 0.4
+  min_speed: 0.0
+  max_speed: 10.0
+
+model:
+  name: N4LidarGCN
+  input_dim: 2
+  hidden_dim: 128
+  output_dim: 2
+  pool_method: mean ## mean or max
+
+  ckpt: ckpts/best_model.pth
+
+benchmark_dir: ./benchmarks/
+
+render: True
+render_mode: human
+hydra:
+  run:
+    dir: ./outputs/train/${now:%Y-%m-%d}/${now:%H-%M-%S}
