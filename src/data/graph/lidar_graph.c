@@ -16,21 +16,23 @@ typedef struct {
     double weight;
 } Edge;
 
-// グローバル変数
-static Node** nodes     = NULL;
-static Edge** edges     = NULL;
-static int*   edge_counts = NULL;
-static int    num_nodes   = 0;
-static int    batch_size  = 0;
+static Node** nodes = NULL;
+static Edge** edges = NULL;
+static int* edge_counts = NULL;
+static int num_nodes = 0;
+static int batch_size = 0;
+static int k_neighbors = 3;
+static double edge_threshold = 1.0;
+static int use_knn = 1; // 1: use KNN, 0: use full search
 
-/* initialize: ノード数とバッチサイズをセットし、既存メモリを解放して再確保 */
 static PyObject* initialize(PyObject* self, PyObject* args) {
-    int new_num_nodes, new_batch_size;
-    if (!PyArg_ParseTuple(args, "ii", &new_num_nodes, &new_batch_size)) {
+    int new_num_nodes, new_batch_size, new_k_neighbors;
+    double new_edge_threshold;
+    int new_use_knn;
+    if (!PyArg_ParseTuple(args, "iiidi", &new_num_nodes, &new_batch_size, &new_k_neighbors, &new_edge_threshold, &new_use_knn)) {
         return NULL;
     }
 
-    // 旧バッファを解放
     if (nodes) {
         for (int i = 0; i < batch_size; i++) {
             free(nodes[i]);
@@ -41,25 +43,25 @@ static PyObject* initialize(PyObject* self, PyObject* args) {
         free(edge_counts);
     }
 
-    // グローバル変数に新サイズを記録
-    num_nodes  = new_num_nodes;
+    num_nodes = new_num_nodes;
     batch_size = new_batch_size;
+    k_neighbors = new_k_neighbors;
+    edge_threshold = new_edge_threshold;
+    use_knn = new_use_knn;
 
-    // 新規メモリ確保
-    nodes       = (Node**)malloc(batch_size * sizeof(Node*));
-    edges       = (Edge**)malloc(batch_size * sizeof(Edge*));
-    edge_counts = (int*) malloc(batch_size * sizeof(int));
+    nodes = (Node**)malloc(batch_size * sizeof(Node*));
+    edges = (Edge**)malloc(batch_size * sizeof(Edge*));
+    edge_counts = (int*)malloc(batch_size * sizeof(int));
 
     for (int b = 0; b < batch_size; b++) {
-        nodes[b]       = (Node*)malloc(num_nodes * sizeof(Node));
-        edges[b]       = (Edge*)malloc(num_nodes * MAX_EDGES_PER_NODE * sizeof(Edge));
+        nodes[b] = (Node*)malloc(num_nodes * sizeof(Node));
+        edges[b] = (Edge*)malloc(num_nodes * MAX_EDGES_PER_NODE * sizeof(Edge));
         edge_counts[b] = 0;
     }
 
     Py_RETURN_NONE;
 }
 
-/* build_graph: バッチ単位の LiDAR スキャンからエッジを構築 */
 static PyObject* build_graph(PyObject* self, PyObject* args) {
     PyObject* input_lists;
     if (!PyArg_ParseTuple(args, "O", &input_lists)) {
@@ -70,46 +72,71 @@ static PyObject* build_graph(PyObject* self, PyObject* args) {
         PyErr_SetString(PyExc_TypeError, "Input is not a list of lists");
         return NULL;
     }
-    int lista_len = PyList_Size(input_lists);
-    if (lista_len != batch_size) {
+    if (PyList_Size(input_lists) != batch_size) {
         PyErr_SetString(PyExc_ValueError, "Batch size mismatch");
         return NULL;
     }
 
     double angle_increment = 270.0 / num_nodes;
 
-    // 各バッチでノード座標計算＋エッジ検出
     for (int b = 0; b < batch_size; b++) {
         PyObject* scan = PyList_GetItem(input_lists, b);
         if (!PyList_Check(scan)) {
             PyErr_SetString(PyExc_TypeError, "Sub-item is not a list");
             return NULL;
         }
-        edge_counts[b] = 0;  // リセット
+        edge_counts[b] = 0;
 
-        // ノード位置 (x,y) を polar→Cartesian 変換
         for (int i = 0; i < num_nodes; i++) {
-            double dist  = PyFloat_AsDouble(PyList_GetItem(scan, i));
+            double dist = PyFloat_AsDouble(PyList_GetItem(scan, i));
             double angle = (-135.0 + i * angle_increment) * DEG2RAD;
             nodes[b][i].x = dist * cos(angle);
             nodes[b][i].y = dist * sin(angle);
         }
-        // 連続点間の距離が閾値以下ならエッジ化
-        for (int i = 0; i < num_nodes - 1; i++) {
-            double dx = nodes[b][i+1].x - nodes[b][i].x;
-            double dy = nodes[b][i+1].y - nodes[b][i].y;
-            double d  = sqrt(dx*dx + dy*dy);
-            if (d < 1.0) {
-                // **ローカルインデックスのみ** を返す
-                edges[b][edge_counts[b]].from   = i;
-                edges[b][edge_counts[b]].to     = i + 1;
-                edges[b][edge_counts[b]].weight = d;
+
+        for (int i = 0; i < num_nodes; i++) {
+            int count = 0;
+            double* distances = (double*)malloc(num_nodes * sizeof(double));
+            int* indices = (int*)malloc(num_nodes * sizeof(int));
+
+            for (int j = 0; j < num_nodes; j++) {
+                if (i == j) continue;
+                double dx = nodes[b][j].x - nodes[b][i].x;
+                double dy = nodes[b][j].y - nodes[b][i].y;
+                double d = sqrt(dx * dx + dy * dy);
+                if (d < edge_threshold) {
+                    distances[count] = d;
+                    indices[count] = j;
+                    count++;
+                }
+            }
+
+            for (int m = 0; m < count - 1; m++) {
+                for (int n = m + 1; n < count; n++) {
+                    if (distances[n] < distances[m]) {
+                        double temp_d = distances[m];
+                        int temp_i = indices[m];
+                        distances[m] = distances[n];
+                        indices[m] = indices[n];
+                        distances[n] = temp_d;
+                        indices[n] = temp_i;
+                    }
+                }
+            }
+
+            int k_limit = use_knn ? k_neighbors : count;
+            for (int k = 0; k < k_limit && k < count && edge_counts[b] < num_nodes * MAX_EDGES_PER_NODE; k++) {
+                edges[b][edge_counts[b]].from = i;
+                edges[b][edge_counts[b]].to = indices[k];
+                edges[b][edge_counts[b]].weight = distances[k];
                 edge_counts[b]++;
             }
+
+            free(distances);
+            free(indices);
         }
     }
 
-    // Python リストにまとめて返却
     PyObject* batch_edge_list = PyList_New(batch_size);
     for (int b = 0; b < batch_size; b++) {
         PyObject* edge_list = PyList_New(edge_counts[b]);
@@ -125,7 +152,6 @@ static PyObject* build_graph(PyObject* self, PyObject* args) {
     return batch_edge_list;
 }
 
-/* get_node_positions: 各バッチのノード (x,y) を返却 */
 static PyObject* get_node_positions(PyObject* self, PyObject* args) {
     PyObject* batch_node_list = PyList_New(batch_size);
     for (int b = 0; b < batch_size; b++) {
@@ -141,10 +167,9 @@ static PyObject* get_node_positions(PyObject* self, PyObject* args) {
     return batch_node_list;
 }
 
-/* モジュール定義 */
 static PyMethodDef LidarGraphMethods[] = {
-    {"initialize",      initialize,      METH_VARARGS, "Initialize graph size and batch size."},
-    {"build_graph",     build_graph,     METH_VARARGS, "Build graph from LiDAR data."},
+    {"initialize", initialize, METH_VARARGS, "Initialize graph size, batch size, k-neighbors, threshold, and mode (KNN or full)."},
+    {"build_graph", build_graph, METH_VARARGS, "Build graph from LiDAR data."},
     {"get_node_positions", get_node_positions, METH_NOARGS, "Get node positions per batch."},
     {NULL, NULL, 0, NULL}
 };
